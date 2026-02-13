@@ -15,7 +15,7 @@
 
 ### 1.1 位置与职责
 
-**文件路径**: `quickstep/src/com/android/quickstep/RecentsAnimationController.java`
+**文件路径**: [RecentsAnimationController.java](quickstep/src/com/android/quickstep/RecentsAnimationController.java)
 
 **主要职责**:
 - 作为 Launcher3 中 recents 动画的控制器包装类
@@ -26,17 +26,17 @@
 ### 1.2 核心组件
 
 ```java
+// quickstep/src/com/android/quickstep/RecentsAnimationController.java#L47-L56
 public class RecentsAnimationController {
-    // 核心成员
+    private static final String TAG = "RecentsAnimationController";
     private final RecentsAnimationControllerCompat mController;
     private final Consumer<RecentsAnimationController> mOnFinishedListener;
 
-    // 状态管理
     private boolean mUseLauncherSysBarFlags = false;
     private boolean mFinishRequested = false;
+    // Only valid when mFinishRequested == true.
     private boolean mFinishTargetIsLauncher;
-    private boolean mLauncherIsVisibleAtFinish;
-    private RunnableList mPendingFinishCallbacks;
+    private RunnableList mPendingFinishCallbacks = new RunnableList();
 }
 ```
 
@@ -56,20 +56,44 @@ public class RecentsAnimationController {
 #### a. 完成动画
 
 ```java
+// quickstep/src/com/android/quickstep/RecentsAnimationController.java#L95-L98
 @UiThread
 public void finish(boolean toRecents, Runnable onFinishComplete, boolean sendUserLeaveHint) {
+    Preconditions.assertUIThread();
     finishController(toRecents, onFinishComplete, sendUserLeaveHint);
 }
 
-private void finishController(boolean toRecents, boolean launcherIsVisibleAtFinish,
-        Runnable callback, boolean sendUserLeaveHint, boolean forceFinish) {
+// quickstep/src/com/android/quickstep/RecentsAnimationController.java#L105-L130
+@UiThread
+public void finishController(boolean toRecents, Runnable callback, boolean sendUserLeaveHint,
+        boolean forceFinish) {
     mPendingFinishCallbacks.add(callback);
+    if (!forceFinish && mFinishRequested) {
+        return;
+    }
+    ActiveGestureProtoLogProxy.logFinishRecentsAnimation(toRecents);
     mFinishRequested = true;
     mFinishTargetIsLauncher = toRecents;
-    mLauncherIsVisibleAtFinish = launcherIsVisibleAtFinish;
-
-    // 通过 AIDL 调用服务端的 finish 方法
-    mController.finish(toRecents, sendUserLeaveHint, resultReceiver);
+    mOnFinishedListener.accept(this);
+    Runnable finishCb = () -> {
+        mController.finish(toRecents, sendUserLeaveHint, new IResultReceiver.Stub() {
+            @Override
+            public void send(int i, Bundle bundle) throws RemoteException {
+                ActiveGestureProtoLogProxy.logFinishRecentsAnimationCallback();
+                MAIN_EXECUTOR.execute(() -> {
+                    mPendingFinishCallbacks.executeAllAndDestroy();
+                });
+            }
+        });
+        InteractionJankMonitorWrapper.end(Cuj.CUJ_LAUNCHER_QUICK_SWITCH);
+        InteractionJankMonitorWrapper.end(Cuj.CUJ_LAUNCHER_APP_CLOSE_TO_HOME);
+        InteractionJankMonitorWrapper.end(Cuj.CUJ_LAUNCHER_APP_SWIPE_TO_RECENTS);
+    };
+    if (forceFinish) {
+        finishCb.run();
+    } else {
+        UI_HELPER_EXECUTOR.execute(finishCb);
+    }
 }
 ```
 
@@ -81,12 +105,17 @@ private void finishController(boolean toRecents, boolean launcherIsVisibleAtFini
 #### b. 系统栏标志管理
 
 ```java
+// quickstep/src/com/android/quickstep/RecentsAnimationController.java#L63-L75
 public void setUseLauncherSystemBarFlags(boolean useLauncherSysBarFlags) {
     if (mUseLauncherSysBarFlags != useLauncherSysBarFlags) {
         mUseLauncherSysBarFlags = useLauncherSysBarFlags;
         UI_HELPER_EXECUTOR.execute(() -> {
-            WindowManagerGlobal.getWindowManagerService()
-                .setRecentsAppBehindSystemBars(useLauncherSysBarFlags);
+            try {
+                WindowManagerGlobal.getWindowManagerService().setRecentsAppBehindSystemBars(
+                        useLauncherSysBarFlags);
+            } catch (RemoteException e) {
+                Log.e(TAG, "Unable to reach window manager", e);
+            }
         });
     }
 }
@@ -97,6 +126,7 @@ public void setUseLauncherSystemBarFlags(boolean useLauncherSysBarFlags) {
 #### c. 截图功能
 
 ```java
+// quickstep/src/com/android/quickstep/RecentsAnimationController.java#L56-L59
 public ThumbnailData screenshotTask(int taskId) {
     return ActivityManagerWrapper.getInstance().takeTaskThumbnail(taskId);
 }
@@ -107,6 +137,7 @@ public ThumbnailData screenshotTask(int taskId) {
 #### d. 输入消费者控制
 
 ```java
+// quickstep/src/com/android/quickstep/RecentsAnimationController.java#L168-L172
 public void enableInputConsumer() {
     UI_HELPER_EXECUTOR.submit(() -> {
         mController.setInputConsumerEnabled(true);
@@ -115,6 +146,23 @@ public void enableInputConsumer() {
 ```
 
 启用输入消费者以开始拦截应用窗口中的触摸事件。
+
+#### e. 动画交接
+
+```java
+// quickstep/src/com/android/quickstep/RecentsAnimationController.java#L77-L83
+@UiThread
+public void handOffAnimation(RemoteAnimationTarget[] targets, WindowAnimationState[] states) {
+    if (TransitionAnimator.Companion.longLivedReturnAnimationsEnabled()) {
+        UI_HELPER_EXECUTOR.execute(() -> mController.handOffAnimation(targets, states));
+    } else {
+        Log.e(TAG, "Tried to hand off the animation, but the feature is disabled",
+                new Exception());
+    }
+}
+```
+
+将正在进行的动画交接给其他处理器，用于长时间存活的返回动画。
 
 ---
 
@@ -161,30 +209,32 @@ public void enableInputConsumer() {
 
 这是定义在 `com.android.wm.shell.recents` 包中的 AIDL 接口，用于客户端与服务端通信。
 
-**主要方法**（基于代码中的使用推断）:
+**文件路径**: [IRecentsAnimationController.aidl](wmshell/src/com/android/wm/shell/recents/IRecentsAnimationController.aidl)
+
+**主要方法**:
 
 ```java
+// wmshell/src/com/android/wm/shell/recents/IRecentsAnimationController.aidl
 interface IRecentsAnimationController {
-    // 完成动画
-    void finish(boolean toHome, boolean sendUserLeaveHint, IResultReceiver resultReceiver);
-
-    // 分离导航栏
-    void detachNavigationBarFromApp(boolean moveHomeToTop);
-
-    // 设置是否将要返回主屏幕
-    void setWillFinishToHome(boolean willFinishToHome);
-
-    // 设置任务完成时的 Surface 事务（用于 PiP）
+    // 设置 PiP 模式的 Surface 事务
     void setFinishTaskTransaction(int taskId,
-        PictureInPictureSurfaceTransaction finishTransaction,
-        SurfaceControl overlay);
+            in PictureInPictureSurfaceTransaction finishTransaction, in SurfaceControl overlay);
+
+    // 完成动画
+    void finish(boolean moveHomeToTop, boolean sendUserLeaveHint, in IResultReceiver finishCb);
 
     // 控制输入消费者
     void setInputConsumerEnabled(boolean enabled);
 
-    // 交接动画控制权（用于长时间存活的返回动画）
-    void handOffAnimation(RemoteAnimationTarget[] targets,
-        WindowAnimationState[] states);
+    // 设置是否将要返回主屏幕
+    void setWillFinishToHome(boolean willFinishToHome);
+
+    // 分离导航栏
+    void detachNavigationBarFromApp(boolean moveHomeToTop);
+
+    // 交接动画控制权
+    oneway void handOffAnimation(in RemoteAnimationTarget[] targets,
+                    in WindowAnimationState[] states);
 }
 ```
 
@@ -192,13 +242,33 @@ interface IRecentsAnimationController {
 
 客户端实现的 AIDL 接口，用于接收服务端的回调。
 
-**在 Launcher3 中的实现**（`SystemUiProxy.kt:1223`）:
+**文件路径**: [IRecentsAnimationRunner.aidl](wmshell/src/com/android/wm/shell/recents/IRecentsAnimationRunner.aidl)
+
+```java
+// wmshell/src/com/android/wm/shell/recents/IRecentsAnimationRunner.aidl
+oneway interface IRecentsAnimationRunner {
+    // 动画取消回调
+    void onAnimationCanceled(in @nullable int[] taskIds,
+            in @nullable TaskSnapshot[] taskSnapshots) = 1;
+
+    // 动画开始回调
+    void onAnimationStart(in IRecentsAnimationController controller,
+            in RemoteAnimationTarget[] apps, in RemoteAnimationTarget[] wallpapers,
+            in Rect homeContentInsets, in Rect minimizedHomeBounds, in Bundle extras,
+            in @nullable TransitionInfo info) = 2;
+
+    // 任务出现回调
+    void onTasksAppeared(in RemoteAnimationTarget[] app,
+            in @nullable TransitionInfo transitionInfo) = 3;
+}
+```
+
+**在 Launcher3 中的实现**（[SystemUiProxy.kt:1296](quickstep/src/com/android/quickstep/SystemUiProxy.kt#L1296)）:
 
 ```kotlin
-private class RecentsAnimationListenerStub(
-    val listener: RecentsAnimationListener
-) : IRecentsAnimationRunner.Stub() {
-
+// quickstep/src/com/android/quickstep/SystemUiProxy.kt#L1296-L1330
+private class RecentsAnimationListenerStub(val listener: RecentsAnimationListener) :
+    IRecentsAnimationRunner.Stub() {
     override fun onAnimationStart(
         controller: IRecentsAnimationController,
         apps: Array<RemoteAnimationTarget>?,
@@ -206,22 +276,28 @@ private class RecentsAnimationListenerStub(
         homeContentInsets: Rect?,
         minimizedHomeBounds: Rect?,
         extras: Bundle?,
-        transitionInfo: TransitionInfo?
-    ) {
-        // 接收动画启动回调
-        val compat = RecentsAnimationControllerCompat(controller)
-        listener.onAnimationStart(compat, apps, wallpapers, ...)
+        transitionInfo: TransitionInfo?,
+    ) =
+        listener.onAnimationStart(
+            RecentsAnimationControllerCompat(controller),
+            apps,
+            wallpapers,
+            homeContentInsets,
+            minimizedHomeBounds,
+            extras?.apply {
+                classLoader = SplitBounds::class.java.classLoader
+            },
+            transitionInfo,
+        )
+
+    override fun onAnimationCanceled(taskIds: IntArray?, taskSnapshots: Array<TaskSnapshot?>?) {
+        listener.onAnimationCanceled(wrap(taskIds, taskSnapshots))
     }
 
-    override fun onAnimationCanceled(thumbnailDatas: HashMap<Int, ThumbnailData>?) {
-        // 接收动画取消回调
-        listener.onAnimationCanceled(thumbnailDatas)
-    }
-
-    override fun onTasksAppeared(apps: Array<RemoteAnimationTarget>?) {
-        // 任务出现回调
-        listener.onTasksAppeared(apps)
-    }
+    override fun onTasksAppeared(
+        apps: Array<RemoteAnimationTarget>?,
+        transitionInfo: TransitionInfo?,
+    ) = listener.onTasksAppeared(apps, transitionInfo)
 }
 ```
 
@@ -231,66 +307,28 @@ private class RecentsAnimationListenerStub(
 
 ### 4.1 整体架构流程图
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Launcher3 进程                             │
-│                                                                   │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │ TaskAnimationManager                                     │    │
-│  │  - 管理手势状态                                          │    │
-│  │  - 创建 RecentsAnimationCallbacks                        │    │
-│  └──────────────────┬──────────────────────────────────────┘    │
-│                     │ startRecentsAnimation()                    │
-│                     ▼                                             │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │ SystemUiProxy (单例)                                     │    │
-│  │  - startRecentsActivity()                                │    │
-│  │  - 持有 IRecentTasks 引用                                │    │
-│  └──────────────────┬──────────────────────────────────────┘    │
-│                     │ IPC Call                                   │
-└─────────────────────┼────────────────────────────────────────────┘
-                      │
-                      │ Binder IPC
-                      ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                     SystemUI Shell 进程                          │
-│                                                                   │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │ RecentTasks (IRecentTasks.Stub)                          │    │
-│  │  - startRecentsTransition()                              │    │
-│  └──────────────────┬──────────────────────────────────────┘    │
-│                     │                                             │
-│                     ▼                                             │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │ RecentsAnimationController (Shell 实现)                  │    │
-│  │  - 管理 Shell 侧的动画逻辑                               │    │
-│  └──────────────────┬──────────────────────────────────────┘    │
-│                     │ 通过 WM Shell 接口                         │
-└─────────────────────┼────────────────────────────────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   System Server 进程                             │
-│                                                                   │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │ WindowManagerService                                     │    │
-│  │  └─ RecentsAnimationController (WM 实现)                 │    │
-│  │     - 真正的窗口动画控制                                 │    │
-│  │     - Surface 事务管理                                   │    │
-│  │     - 窗口层级控制                                       │    │
-│  └─────────────────┬────────────────────────────────────────┘    │
-│                    │ 回调                                         │
-└────────────────────┼──────────────────────────────────────────────┘
-                     │
-                     │ IRecentsAnimationController (AIDL)
-                     ▼
-         ┌───────────────────────────┐
-         │  回到 Launcher3            │
-         │  RecentsAnimationCallbacks │
-         │  ├─ onAnimationStart()     │
-         │  ├─ onAnimationCanceled()  │
-         │  └─ onTasksAppeared()      │
-         └───────────────────────────┘
+```mermaid
+graph TD
+    subgraph Launcher3进程
+        A[TaskAnimationManager] -->|startRecentsAnimation| B[SystemUiProxy]
+        B -->|IPC Call| C[RecentsAnimationListenerStub]
+        C -->|onAnimationStart| D[RecentsAnimationCallbacks]
+        D -->|创建| E[RecentsAnimationController<br/>客户端]
+    end
+
+    subgraph SystemUI Shell进程
+        F[RecentTasks<br/>IRecentTasks.Stub]
+        F -->|startRecentsTransition| G[RecentsAnimationController<br/>Shell实现]
+    end
+
+    subgraph System Server进程
+        H[WindowManagerService]
+        H --> I[RecentsAnimationController<br/>WM实现]
+    end
+
+    B -->|Binder IPC| F
+    G -->|WM Shell接口| H
+    I -->|IRecentsAnimationController<br/>AIDL回调| C
 ```
 
 ### 4.2 详细连接步骤
@@ -300,53 +338,67 @@ private class RecentsAnimationListenerStub(
 **触发点**: 用户执行手势（如向上滑动）
 
 ```java
-// TaskAnimationManager.java:133
-public RecentsAnimationCallbacks startRecentsAnimation(
-        @NonNull GestureState gestureState,
-        Intent intent,
-        RecentsAnimationCallbacks.RecentsAnimationListener listener) {
-
+// quickstep/src/com/android/quickstep/TaskAnimationManager.java#L114-L200
+@UiThread
+public RecentsAnimationCallbacks startRecentsAnimation(@NonNull GestureState gestureState,
+        Intent intent, RecentsAnimationCallbacks.RecentsAnimationListener listener) {
+    ActiveGestureProtoLogProxy.logStartRecentsAnimation();
+    
     // 1. 创建回调对象
-    RecentsAnimationCallbacks newCallbacks =
-        new RecentsAnimationCallbacks(getSystemUiProxy());
-
-    // 2. 添加监听器
+    RecentsAnimationCallbacks newCallbacks = new RecentsAnimationCallbacks(
+            containerInterface.getCreatedContainer());
     mCallbacks = newCallbacks;
-    mCallbacks.addListener(listener);
+    
+    // 2. 添加监听器
     mCallbacks.addListener(gestureState);
+    mCallbacks.addListener(listener);
 
     // 3. 准备 ActivityOptions
     final ActivityOptions options = ActivityOptions.makeBasic();
+    options.setPendingIntentBackgroundActivityStartMode(
+            ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_ALLOW_ALWAYS);
     options.setTransientLaunch();
     options.setSourceInfo(ActivityOptions.SourceInfo.TYPE_RECENTS_ANIMATION, eventTime);
+    options.setLaunchDisplayId(mDisplayId);
 
     // 4. 通过 SystemUiProxy 启动
-    getSystemUiProxy().startRecentsActivity(intent, options, mCallbacks, false);
+    getSystemUiProxy().startRecentsActivity(intent, options, mCallbacks, 
+            false, null, mDisplayId);
 
-    return mCallbacks;
+    return newCallbacks;
 }
 ```
 
 #### 步骤 2: SystemUiProxy 桥接
 
-**SystemUiProxy.kt:1196**
+**文件路径**: [SystemUiProxy.kt:1265](quickstep/src/com/android/quickstep/SystemUiProxy.kt#L1265)
 
 ```kotlin
+// quickstep/src/com/android/quickstep/SystemUiProxy.kt#L1265-L1294
 fun startRecentsActivity(
     intent: Intent?,
     options: ActivityOptions,
     listener: RecentsAnimationListener,
     useSyntheticRecentsTransition: Boolean,
+    wct: WindowContainerTransaction? = null,
+    displayId: Int,
 ): Boolean {
-    // 调用 Shell 层的 IRecentTasks 接口
-    recentTasks?.startRecentsTransition(
-        recentsPendingIntent,
-        intent,
-        options.toBundle(),
-        context.iApplicationThread,
-        RecentsAnimationListenerStub(listener),  // ← AIDL Stub 实现
-    )
-    return true
+    executeWithErrorLog({ "Error starting recents via shell" }) {
+        recentTasks?.startRecentsTransition(
+            getRecentsPendingIntent(displayId),
+            intent,
+            options.toBundle().apply {
+                if (useSyntheticRecentsTransition) {
+                    putBoolean("is_synthetic_recents_transition", true)
+                }
+            },
+            wct,
+            context.iApplicationThread,
+            RecentsAnimationListenerStub(listener),  // ← AIDL Stub 实现
+        )
+        return true
+    }
+    return false
 }
 ```
 
@@ -366,30 +418,38 @@ fun startRecentsActivity(
 
 #### 步骤 4: 客户端接收回调
 
-**RecentsAnimationCallbacks.java:104**
+**文件路径**: [RecentsAnimationCallbacks.java:80](quickstep/src/com/android/quickstep/RecentsAnimationCallbacks.java#L80)
 
 ```java
+// quickstep/src/com/android/quickstep/RecentsAnimationCallbacks.java#L80-L134
 @BinderThread
-public final void onAnimationStart(
-        RecentsAnimationControllerCompat animationController,
+public final void onAnimationStart(RecentsAnimationControllerCompat animationController,
         RemoteAnimationTarget[] appTargets,
         RemoteAnimationTarget[] wallpaperTargets,
-        Rect homeContentInsets,
-        Rect minimizedHomeBounds,
-        Bundle extras,
+        Rect homeContentInsets, Rect minimizedHomeBounds, Bundle extras,
         @Nullable TransitionInfo transitionInfo) {
+    long appCount = Arrays.stream(appTargets)
+            .filter(app -> app.mode == MODE_CLOSING)
+            .count();
+
+    boolean isOpeningHome = Arrays.stream(appTargets)
+            .filter(app -> app.mode == MODE_OPENING
+                    && app.windowConfiguration.getActivityType() == ACTIVITY_TYPE_HOME)
+            .count() > 0;
+    if (appCount == 0 && (!(mContainer instanceof RecentsWindowManager)
+            || isOpeningHome)) {
+        // 边缘情况：没有关闭的应用目标，取消动画
+        notifyAnimationCanceled();
+        animationController.finish(false, false, null);
+        return;
+    }
 
     // 1. 创建 Launcher3 的 RecentsAnimationController
-    mController = new RecentsAnimationController(
-        animationController,  // ← 包装了 IRecentsAnimationController
-        this::onAnimationFinished
-    );
+    mController = new RecentsAnimationController(animationController, this::onAnimationFinished);
 
     // 2. 创建动画目标包装
-    final RecentsAnimationTargets targets = new RecentsAnimationTargets(
-        appTargets, wallpaperTargets, nonAppTargets,
-        homeContentInsets, minimizedHomeBounds, extras
-    );
+    final RecentsAnimationTargets targets = new RecentsAnimationTargets(appTargets,
+            wallpaperTargets, nonAppTargets, homeContentInsets, minimizedHomeBounds, extras);
 
     // 3. 分发给所有监听器
     Utilities.postAsyncCallback(MAIN_EXECUTOR.getHandler(), () -> {
@@ -412,24 +472,39 @@ public final void onAnimationStart(
 这是 SystemUI Shared 库中的类，位于：
 `com.android.systemui.shared.system.RecentsAnimationControllerCompat`
 
+**文件路径**: [RecentsAnimationControllerCompat.java](systemUI/shared/src/com/android/systemui/shared/system/RecentsAnimationControllerCompat.java)
+
 **作用**:
 ```java
+// systemUI/shared/src/com/android/systemui/shared/system/RecentsAnimationControllerCompat.java#L30-L50
 public class RecentsAnimationControllerCompat {
-    private final IRecentsAnimationController mAnimationController;
+    private static final String TAG = RecentsAnimationControllerCompat.class.getSimpleName();
+    private IRecentsAnimationController mAnimationController;
 
-    public RecentsAnimationControllerCompat(IRecentsAnimationController controller) {
-        mAnimationController = controller;
+    public RecentsAnimationControllerCompat(IRecentsAnimationController animationController) {
+        mAnimationController = animationController;
     }
 
-    public void finish(boolean toHome, boolean sendUserLeaveHint,
-                      IResultReceiver resultReceiver) {
+    public void setInputConsumerEnabled(boolean enabled) {
         try {
-            mAnimationController.finish(toHome, sendUserLeaveHint, resultReceiver);
+            mAnimationController.setInputConsumerEnabled(enabled);
         } catch (RemoteException e) {
-            Log.e(TAG, "Failed to finish recents animation", e);
+            Log.e(TAG, "Failed to set input consumer enabled state", e);
         }
     }
 
+    public void finish(boolean toHome, boolean sendUserLeaveHint, IResultReceiver finishCb) {
+        try {
+            mAnimationController.finish(toHome, sendUserLeaveHint, finishCb);
+        } catch (RemoteException e) {
+            Log.e(TAG, "Failed to finish recents animation", e);
+            try {
+                finishCb.send(0, null);
+            } catch (Exception ex) {
+                // Local call, can ignore
+            }
+        }
+    }
     // 其他方法类似，都是对 AIDL 接口的简单包装
 }
 ```
@@ -440,96 +515,54 @@ public class RecentsAnimationControllerCompat {
 
 ### 5.1 启动流程数据流
 
-```
-用户手势
-   │
-   ▼
-TouchInteractionService (监听手势)
-   │
-   ▼
-TaskAnimationManager.startRecentsAnimation()
-   │
-   ├─ 创建 RecentsAnimationCallbacks
-   │
-   ▼
-SystemUiProxy.startRecentsActivity()
-   │
-   ├─ 封装 RecentsAnimationListenerStub (AIDL)
-   │
-   ▼
-[Binder IPC]
-   │
-   ▼
-SystemUI Shell: RecentTasks.startRecentsTransition()
-   │
-   ▼
-WindowManagerService
-   │
-   ├─ 创建 RecentsAnimationController (服务端)
-   ├─ 准备 RemoteAnimationTarget[]
-   │
-   ▼
-[Binder IPC 回调]
-   │
-   ▼
-IRecentsAnimationRunner.onAnimationStart()
-   │
-   ▼
-RecentsAnimationListenerStub.onAnimationStart()
-   │
-   ├─ 创建 RecentsAnimationControllerCompat
-   │     (包装 IRecentsAnimationController)
-   │
-   ▼
-RecentsAnimationCallbacks.onAnimationStart()
-   │
-   ├─ 创建 RecentsAnimationController (客户端)
-   │     (包装 RecentsAnimationControllerCompat)
-   │
-   ▼
-分发给各个监听器:
-   ├─ AbsSwipeUpHandler
-   ├─ TaskAnimationManager
-   └─ GestureState
+```mermaid
+sequenceDiagram
+    participant User as 用户
+    participant TIS as TouchInteractionService
+    participant TAM as TaskAnimationManager
+    participant SUP as SystemUiProxy
+    participant Shell as SystemUI Shell
+    participant WMS as WindowManagerService
+    participant RAC as RecentsAnimationCallbacks
+    participant Controller as RecentsAnimationController
+
+    User->>TIS: 执行上滑手势
+    TIS->>TAM: startRecentsAnimation()
+    TAM->>TAM: 创建 RecentsAnimationCallbacks
+    TAM->>SUP: startRecentsActivity()
+    SUP->>SUP: 封装 RecentsAnimationListenerStub
+    SUP->>Shell: Binder IPC: startRecentsTransition()
+    Shell->>WMS: 请求创建动画
+    WMS->>WMS: 创建 RecentsAnimationController(服务端)
+    WMS->>WMS: 准备 RemoteAnimationTarget[]
+    WMS-->>SUP: Binder IPC回调: onAnimationStart()
+    SUP->>RAC: onAnimationStart()
+    RAC->>RAC: 创建 RecentsAnimationController(客户端)
+    RAC->>Controller: 分发给监听器
 ```
 
 ### 5.2 完成流程数据流
 
-```
-Launcher3 UI 事件
-   │
-   ▼
-RecentsAnimationController.finish()
-   │
-   ▼
-RecentsAnimationControllerCompat.finish()
-   │
-   ▼
-[Binder IPC]
-   │
-   ▼
-IRecentsAnimationController.finish()
-   │
-   ▼
-WindowManager RecentsAnimationController
-   │
-   ├─ 应用最终 Surface 事务
-   ├─ 恢复窗口状态
-   ├─ 清理动画资源
-   │
-   ▼
-IResultReceiver.send() (回调完成)
-   │
-   ▼
-[Binder IPC]
-   │
-   ▼
-RecentsAnimationController (客户端)
-   │
-   ├─ 执行 mPendingFinishCallbacks
-   │
-   ▼
-清理 Launcher3 侧资源
+```mermaid
+sequenceDiagram
+    participant Launcher as Launcher3 UI
+    participant RAC as RecentsAnimationController
+    participant Compat as RecentsAnimationControllerCompat
+    participant WMS as WindowManagerService
+    participant Callback as IResultReceiver
+
+    Launcher->>RAC: finish(toRecents=true)
+    RAC->>RAC: finishController()
+    RAC->>RAC: 设置 mFinishRequested=true
+    RAC->>Compat: finish()
+    Compat->>WMS: Binder IPC: IRecentsAnimationController.finish()
+    WMS->>WMS: 应用最终 Surface 事务
+    WMS->>WMS: 恢复窗口状态
+    WMS->>WMS: 清理动画资源
+    WMS-->>Callback: send() 回调完成
+    Callback->>RAC: Binder IPC
+    RAC->>RAC: 执行 mPendingFinishCallbacks
+    RAC->>Launcher: 清理 Launcher3 侧资源
 ```
 
 ---
@@ -538,34 +571,20 @@ RecentsAnimationController (客户端)
 
 ### 6.1 场景 1: 从应用滑动到 Launcher
 
-```java
-// 1. 用户开始滑动
-AbsSwipeUpHandler.onGestureStarted()
-    │
-    ▼
-// 2. 启动 recents 动画
-TaskAnimationManager.startRecentsAnimation()
-    │
-    ▼
-// 3. 接收动画开始回调
-AbsSwipeUpHandler.onRecentsAnimationStart(controller, targets)
-    │
-    ├─ 获取应用窗口的 Surface
-    ├─ 创建过渡动画
-    │
-    ▼
-// 4. 用户完成滑动手势
-AbsSwipeUpHandler.handleTaskAppeared()
-    │
-    ├─ 判断目标（Launcher 或 App）
-    │
-    ▼
-// 5. 完成动画
-controller.finish(toRecents=true)
-    │
-    ▼
-// 6. 系统切换到 Launcher
-WindowManager 完成窗口切换
+```mermaid
+graph TD
+    A[用户开始滑动] --> B[AbsSwipeUpHandler.onGestureStarted]
+    B --> C[TaskAnimationManager.startRecentsAnimation]
+    C --> D[AbsSwipeUpHandler.onRecentsAnimationStart]
+    D --> E[获取应用窗口的 Surface]
+    E --> F[创建过渡动画]
+    F --> G[用户完成滑动手势]
+    G --> H[AbsSwipeUpHandler.handleTaskAppeared]
+    H --> I{判断目标}
+    I -->|Launcher| J[controller.finish toRecents=true]
+    I -->|App| K[controller.finish toRecents=false]
+    J --> L[WindowManager 完成窗口切换]
+    K --> L
 ```
 
 ### 6.2 场景 2: PiP（画中画）模式
@@ -587,136 +606,181 @@ RecentsAnimationController.setFinishTaskTransaction(
 controller.finish(toRecents=true, sendUserLeaveHint=true)
     │
     ▼
-// 4. WindowManager 应用 pipTransaction
-//    将任务调整为 PiP 大小和位置
+// WindowManager 应用 PiP Surface 事务
 ```
 
-### 6.3 场景 3: 动画取消
+### 6.3 场景 3: 快速切换应用
 
-```java
-// 1. 用户中途取消手势
-InputConsumer.onTouchEvent(ACTION_CANCEL)
-    │
-    ▼
-// 2. 请求取消动画
-SystemUiProxy.cancelRecentsAnimation()
-    │
-    ▼
-[Binder IPC]
-    │
-    ▼
-// 3. 服务端发送取消回调
-IRecentsAnimationRunner.onAnimationCanceled(thumbnailDatas)
-    │
-    ▼
-// 4. 客户端处理取消
-RecentsAnimationCallbacks.onAnimationCanceled()
-    │
-    ├─ 恢复原始窗口状态
-    ├─ 使用 thumbnailData 显示截图
-    └─ 清理资源
+```mermaid
+graph TD
+    A[用户快速滑动切换] --> B[QuickSwitch手势]
+    B --> C[启动Recents动画]
+    C --> D[onTasksAppeared回调]
+    D --> E[检测到目标任务出现]
+    E --> F[RecentsView.launchSideTaskInLiveTileMode]
+    F --> G[完成动画到新应用]
 ```
 
 ---
 
-## 7. 线程模型
+## 7. RecentsAnimationTargets 数据结构
 
-### 7.1 客户端线程
+### 7.1 类定义
 
-Launcher3 的 `RecentsAnimationController` 严格要求在 UI 线程操作：
+**文件路径**: [RecentsAnimationTargets.java](quickstep/src/com/android/quickstep/RecentsAnimationTargets.java)
 
 ```java
-@UiThread
-public void finish(boolean toRecents, Runnable onFinishComplete) {
-    Preconditions.assertUIThread();  // ← 断言必须在 UI 线程
-    finishController(toRecents, onFinishComplete, false);
+// quickstep/src/com/android/quickstep/RecentsAnimationTargets.java#L29-L38
+public class RecentsAnimationTargets extends RemoteAnimationTargets {
+
+    public final Rect homeContentInsets;
+    public final Rect minimizedHomeBounds;
+
+    public RecentsAnimationTargets(RemoteAnimationTarget[] apps,
+            RemoteAnimationTarget[] wallpapers, RemoteAnimationTarget[] nonApps,
+            Rect homeContentInsets, Rect minimizedHomeBounds, Bundle extras) {
+        super(apps, wallpapers, nonApps, MODE_CLOSING, extras);
+        this.homeContentInsets = homeContentInsets;
+        this.minimizedHomeBounds = minimizedHomeBounds;
+    }
 }
 ```
 
-但实际的 IPC 调用在后台线程执行：
+### 7.2 继承关系
 
-```java
-UI_HELPER_EXECUTOR.execute(() -> {
-    mController.finish(toRecents, sendUserLeaveHint, resultReceiver);
-});
-```
-
-### 7.2 服务端线程
-
-服务端的 `RecentsAnimationController` 运行在 WindowManager 的同步事务线程上，确保窗口状态的一致性。
-
-### 7.3 回调线程
-
-AIDL 回调发生在 Binder 线程池，因此需要切换到主线程：
-
-```java
-@BinderThread
-public final void onAnimationStart(...) {
-    // 切换到主线程
-    Utilities.postAsyncCallback(MAIN_EXECUTOR.getHandler(), () -> {
-        for (RecentsAnimationListener listener : getListeners()) {
-            listener.onRecentsAnimationStart(mController, targets, transitionInfo);
-        }
-    });
-}
+```mermaid
+graph TD
+    A[RemoteAnimationTargets] --> B[RecentsAnimationTargets]
+    A --> C[apps: RemoteAnimationTarget数组]
+    A --> D[wallpapers: RemoteAnimationTarget数组]
+    A --> E[nonApps: RemoteAnimationTarget数组]
+    A --> F[extras: Bundle]
+    B --> G[homeContentInsets: Rect]
+    B --> H[minimizedHomeBounds: Rect]
 ```
 
 ---
 
-## 8. 总结
+## 8. 线程模型
 
-### 8.1 两个 RecentsAnimationController 的关系
+### 8.1 线程使用规范
 
-| 方面 | 客户端 (Launcher3) | 服务端 (WindowManager) |
-|------|-------------------|----------------------|
-| **包名** | `com.android.quickstep` | `com.android.server.wm` |
-| **职责** | UI 控制、手势处理、回调管理 | 窗口管理、Surface 控制、系统动画 |
-| **线程** | UI 线程 + UI Helper 线程 | WM 同步事务线程 |
-| **生命周期** | 由手势触发，跟随动画周期 | 由 WMS 管理，独立于应用 |
-| **通信方式** | 通过 AIDL 调用服务端 | 通过 AIDL 回调客户端 |
+```mermaid
+graph LR
+    subgraph Binder线程
+        A[onAnimationStart] --> B[postAsyncCallback]
+        C[onAnimationCanceled] --> D[postAsyncCallback]
+        E[onTasksAppeared] --> F[postAsyncCallback]
+    end
 
-### 8.2 关键设计模式
+    subgraph UI线程
+        B --> G[分发给监听器]
+        D --> H[清理动画]
+        F --> I[处理任务出现]
+    end
 
-1. **代理模式**: `RecentsAnimationControllerCompat` 代理 `IRecentsAnimationController`
-
-2. **观察者模式**: `RecentsAnimationCallbacks` 管理多个监听器
-
-3. **门面模式**: `SystemUiProxy` 统一管理所有系统 UI 交互
-
-4. **包装器模式**: 客户端的 `RecentsAnimationController` 包装 Compat 对象
-
-### 8.3 核心交互链路
-
-```
-Launcher3 Gesture
-    ↓
-TaskAnimationManager
-    ↓
-SystemUiProxy (IRecentTasks)
-    ↓ [Binder IPC]
-Shell RecentsAnimationController
-    ↓
-WindowManagerService RecentsAnimationController
-    ↓ [AIDL Callback]
-RecentsAnimationListenerStub
-    ↓
-RecentsAnimationCallbacks
-    ↓
-Launcher3 RecentsAnimationController
-    ↓
-AbsSwipeUpHandler (处理手势)
+    subgraph UI_HELPER线程
+        J[finish调用] --> K[AIDL IPC]
+        L[setInputConsumerEnabled] --> M[AIDL IPC]
+    end
 ```
 
-### 8.4 关键要点
+### 8.2 线程安全机制
 
-1. **进程隔离**: 客户端在 Launcher3 进程，服务端在 System Server 进程
+1. **UI线程注解**: 使用 `@UiThread` 标注必须在主线程调用的方法
+2. **Binder线程注解**: 使用 `@BinderThread` 标注来自 Binder 回调的方法
+3. **线程切换**: 使用 `MAIN_EXECUTOR` 和 `UI_HELPER_EXECUTOR` 进行线程切换
+4. **异步回调**: 使用 `Utilities.postAsyncCallback()` 确保回调在正确的线程执行
 
-2. **AIDL 通信**: 通过 `IRecentsAnimationController` 和 `IRecentsAnimationRunner` 双向通信
+---
 
-3. **线程安全**: 客户端确保 UI 线程安全，服务端在 WM 事务线程
+## 9. 状态管理
 
-4. **生命周期管理**: 动画从启动到完成/取消的完整生命周期管理
+### 9.1 动画状态标志
 
-5. **异步回调**: 所有操作都是异步的，通过回调通知结果
+```java
+// quickstep/src/com/android/quickstep/RecentsAnimationController.java
+private boolean mUseLauncherSysBarFlags = false;  // 系统栏标志状态
+private boolean mFinishRequested = false;          // 是否已请求完成
+private boolean mFinishTargetIsLauncher;           // 完成目标是否为Launcher
+```
+
+### 9.2 状态转换图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Initialized: 创建RecentsAnimationController
+    Initialized --> Running: onAnimationStart
+    Running --> Finishing: finish()调用
+    Finishing --> Finished: IResultReceiver回调
+    Running --> Canceled: onAnimationCanceled
+    Canceled --> [*]
+    Finished --> [*]
+```
+
+---
+
+## 10. 设计思想和理念
+
+### 10.1 架构设计原则
+
+1. **职责分离**:
+   - 客户端负责 UI 层面的动画控制和状态管理
+   - 服务端负责窗口层面的 Surface 和层级管理
+   - 通过 AIDL 接口清晰划分职责边界
+
+2. **进程隔离**:
+   - Launcher3 进程与 SystemUI/WindowManager 进程完全隔离
+   - 通过 Binder IPC 实现跨进程通信
+   - 保证系统稳定性和安全性
+
+3. **异步非阻塞**:
+   - 所有跨进程调用都是异步的
+   - 使用回调机制处理结果
+   - 避免阻塞 UI 线程
+
+4. **线程安全**:
+   - 明确的线程模型和注解
+   - 使用 Executor 进行线程切换
+   - 避免并发问题
+
+### 10.2 性能优化设计
+
+1. **Surface 控制**:
+   - 直接操作 Surface 而非 View 层级
+   - 减少布局计算和重绘
+   - 实现流畅的 60fps 动画
+
+2. **输入消费者**:
+   - 提前注册输入消费者
+   - 动画过程中动态启用
+   - 避免事件丢失和卡顿
+
+3. **资源管理**:
+   - 及时清理动画资源
+   - 使用 RunnableList 管理回调
+   - 避免内存泄漏
 
 这种设计实现了职责分离、进程隔离和高性能的动画系统，是 Android 现代手势导航的核心基础设施。
+
+---
+
+## 11. 源码文件索引
+
+| 文件 | 路径 | 说明 |
+|------|------|------|
+| RecentsAnimationController.java | quickstep/src/com/android/quickstep/ | 客户端控制器 |
+| RecentsAnimationControllerCompat.java | systemUI/shared/src/com/android/systemui/shared/system/ | 兼容层包装 |
+| IRecentsAnimationController.aidl | wmshell/src/com/android/wm/shell/recents/ | AIDL 控制器接口 |
+| IRecentsAnimationRunner.aidl | wmshell/src/com/android/wm/shell/recents/ | AIDL 回调接口 |
+| TaskAnimationManager.java | quickstep/src/com/android/quickstep/ | 动画管理器 |
+| RecentsAnimationCallbacks.java | quickstep/src/com/android/quickstep/ | 回调分发器 |
+| RecentsAnimationTargets.java | quickstep/src/com/android/quickstep/ | 动画目标数据 |
+| SystemUiProxy.kt | quickstep/src/com/android/quickstep/ | SystemUI 代理 |
+
+---
+
+**最后更新**: 2026年2月13日  
+**适用AOSP版本**: Android 14+  
+**核心分析范围**: Launcher3 / SystemUI / WindowManager  
+**输出格式**: Markdown文档 + Mermaid图表 + 源码证据链
